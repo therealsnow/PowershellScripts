@@ -1,0 +1,275 @@
+<#
+.SYNOPSIS
+    Deduplicates, archives old files, and removes empty folders in a SharePoint Online document library.
+.DESCRIPTION
+    1. Hashes all files in the source library using SHA256 and recycles duplicate copies (keeping the oldest).
+    2. Moves files older than a specified number of months to an archive library while preserving folder structure and Modified timestamps.
+    3. Recursively recycles empty folders left behind in the source library.
+.NOTES
+    Requires the PnP.PowerShell module and an Entra ID (Azure AD) App Registration with SharePoint permissions.
+#>
+
+# --- CONFIGURATION ---
+$SiteUrl        = "https://contoso.sharepoint.com/sites/YourSiteName"
+$ClientId       = "00000000-0000-0000-0000-000000000000" # Your Entra ID App Registration Client ID
+
+$SourceLibrary  = "Documents"  # Display name of source library
+$ArchiveLibrary = "Archive"    # Display name of destination Archive library
+$MonthsOld      = 12           # Move files not modified in this many months
+$DryRun         = $true        # Set to $false to execute deletions, moves, and folder cleanup
+
+# --- HELPER FUNCTION FOR DETAILED ERROR LOGGING ---
+function Write-DetailedError {
+    param (
+        [string]$Context,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+    Write-Host "`n[ERROR] $Context" -ForegroundColor Red
+    Write-Host "  Message     : $($ErrorRecord.Exception.Message)" -ForegroundColor Red
+    if ($ErrorRecord.Exception.InnerException) {
+        Write-Host "  Inner Error : $($ErrorRecord.Exception.InnerException.Message)" -ForegroundColor DarkRed
+    }
+    Write-Host "  Line Number : $($ErrorRecord.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkRed
+    Write-Host "  Failing Code: $($ErrorRecord.InvocationInfo.Line.Trim())" -ForegroundColor DarkRed
+    Write-Host "  Stack Trace : $($ErrorRecord.ScriptStackTrace)" -ForegroundColor DarkGray
+}
+
+# --- GUARD CHECK ---
+if ([string]::IsNullOrWhiteSpace($SourceLibrary) -or [string]::IsNullOrWhiteSpace($ArchiveLibrary)) {
+    throw "SourceLibrary or ArchiveLibrary cannot be blank. Check your CONFIGURATION block."
+}
+
+# --- CONNECT ---
+Connect-PnPOnline -Url $SiteUrl -Interactive -ClientId $ClientId
+
+# Resolve exact server-relative root URLs directly from SharePoint list objects
+try {
+    $SourceListObj     = Get-PnPList -Identity $SourceLibrary -Includes RootFolder -ErrorAction Stop
+    $SourceRootPath    = $SourceListObj.RootFolder.ServerRelativeUrl.TrimEnd('/')
+
+    $ArchiveListObj    = Get-PnPList -Identity $ArchiveLibrary -Includes RootFolder -ErrorAction Stop
+    $ArchiveRoot       = $ArchiveListObj.RootFolder.ServerRelativeUrl.TrimEnd('/')
+
+    $SiteServerRelPath = ([Uri]$SiteUrl).AbsolutePath.TrimEnd('/')
+}
+catch {
+    Write-DetailedError -Context "Failed to resolve Source or Archive library paths. Verify library display names." -ErrorRecord $_
+    Disconnect-PnPOnline
+    return
+}
+
+$CutoffDate = (Get-Date).AddMonths(-$MonthsOld)
+Write-Host "Source Library : '$SourceLibrary' ($SourceRootPath)" -ForegroundColor Cyan
+Write-Host "Archive Library: '$ArchiveLibrary' ($ArchiveRoot)" -ForegroundColor Cyan
+Write-Host "Cutoff Date    : $CutoffDate" -ForegroundColor Cyan
+
+# Retrieve all items (files and folders) in batches of 2,000
+$AllLibraryItems = Get-PnPListItem -List $SourceLibrary -PageSize 2000
+
+$AllFiles = $AllLibraryItems | Where-Object {
+    $_.FileSystemObjectType -eq "File" -and
+    $_.FieldValues["FileRef"] -notlike "$ArchiveRoot/*" # Safety check if Archive is inside Source
+}
+
+$FileRecords = @()
+
+foreach ($Item in $AllFiles) {
+    $FileRef  = $Item["FileRef"]
+    $FileName = $Item["FileLeafRef"]
+    $Modified = [datetime]$Item["Modified"]
+
+    try {
+        $Stream     = Get-PnPFile -Url $FileRef -AsMemoryStream -ErrorAction Stop
+        $HashResult = Get-FileHash -InputStream $Stream -Algorithm SHA256
+        $Stream.Dispose()
+
+        $FileRecords += [PSCustomObject]@{
+            Id       = $Item.Id
+            Name     = $FileName
+            Path     = $FileRef
+            Modified = $Modified
+            Hash     = $HashResult.Hash
+        }
+    }
+    catch {
+        Write-DetailedError -Context "Failed while hashing '$FileRef'" -ErrorRecord $_
+    }
+}
+
+# Track every file/folder path removed from the source library
+$RemovedSourcePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+# ==============================================================================
+# PHASE 1: DEDUPLICATE BY SHA256 CONTENT HASH
+# ==============================================================================
+Write-Host "`n--- PHASE 1: DEDUPLICATION ---" -ForegroundColor Cyan
+
+$RecycledIds     = [System.Collections.Generic.HashSet[int]]::new()
+$DuplicateGroups = $FileRecords | Group-Object -Property Hash | Where-Object { $_.Count -gt 1 }
+
+if (-not $DuplicateGroups) {
+    Write-Host "No duplicate files found." -ForegroundColor Green
+}
+else {
+    Write-Host "Found $($DuplicateGroups.Count) sets of duplicate files." -ForegroundColor Yellow
+
+    foreach ($Group in $DuplicateGroups) {
+        # Sort ascending to KEEP the oldest copy; change to -Descending to keep the newest
+        $SortedFiles = $Group.Group | Sort-Object -Property Modified
+        $Original    = $SortedFiles[0]
+        $Duplicates  = $SortedFiles | Select-Object -Skip 1
+
+        Write-Host "[KEEP] $($Original.Path) (Modified: $($Original.Modified))" -ForegroundColor Green
+
+        foreach ($Dup in $Duplicates) {
+            [void]$RecycledIds.Add($Dup.Id)
+
+            if ($DryRun) {
+                Write-Host "  [DRY RUN - WOULD RECYCLE] $($Dup.Path)" -ForegroundColor DarkYellow
+                [void]$RemovedSourcePaths.Add($Dup.Path)
+            }
+            else {
+                try {
+                    Write-Host "  [RECYCLING] $($Dup.Path)" -ForegroundColor Red
+                    Remove-PnPListItem -List $SourceLibrary -Identity $Dup.Id -Recycle -Force -ErrorAction Stop
+                    [void]$RemovedSourcePaths.Add($Dup.Path)
+                }
+                catch {
+                    Write-DetailedError -Context "Failed to recycle duplicate '$($Dup.Path)'" -ErrorRecord $_
+                }
+            }
+        }
+    }
+}
+
+# ==============================================================================
+# PHASE 2: ARCHIVE REMAINING FILES OLDER THAN $MonthsOld MONTHS (STREAM UPLOAD)
+# ==============================================================================
+Write-Host "`n--- PHASE 2: ARCHIVING FILES OLDER THAN $MonthsOld MONTHS ---" -ForegroundColor Cyan
+
+$FilesToArchive = $FileRecords | Where-Object {
+    (-not $RecycledIds.Contains($_.Id)) -and ($_.Modified -lt $CutoffDate)
+}
+
+if (-not $FilesToArchive) {
+    Write-Host "No files older than $MonthsOld months need archiving." -ForegroundColor Green
+}
+else {
+    Write-Host "Found $($FilesToArchive.Count) files to archive." -ForegroundColor Yellow
+
+    foreach ($File in $FilesToArchive) {
+        # Strip the source library root path to isolate the relative subfolder + filename
+        $RelativeFilePath = $File.Path.Substring($SourceRootPath.Length)
+        $TargetUrl        = "$ArchiveRoot$RelativeFilePath"
+        $TargetFolderUrl  = $TargetUrl.Substring(0, $TargetUrl.LastIndexOf('/'))
+        $TargetFileName   = $File.Name
+
+        # Check if a file with the exact same name already exists in that specific Archive subfolder
+        $ExistingFile = Get-PnPFile -Url $TargetUrl -ErrorAction SilentlyContinue
+        if ($ExistingFile) {
+            $BaseName       = [System.IO.Path]::GetFileNameWithoutExtension($File.Name)
+            $Extension      = [System.IO.Path]::GetExtension($File.Name)
+            $Timestamp      = Get-Date -Format "yyyyMMdd-HHmmss"
+            $TargetFileName = "${BaseName}_${Timestamp}${Extension}"
+            $TargetUrl      = "$TargetFolderUrl/$TargetFileName"
+        }
+
+        if ($DryRun) {
+            Write-Host "  [DRY RUN - WOULD ARCHIVE] $($File.Path)" -ForegroundColor DarkYellow
+            Write-Host "                         -> $TargetUrl (Modified: $($File.Modified))" -ForegroundColor DarkYellow
+            [void]$RemovedSourcePaths.Add($File.Path)
+        }
+        else {
+            $UploadStream = $null
+            try {
+                # 1. Ensure the destination subfolder tree exists
+                $SiteRelativeTargetFolder = $TargetFolderUrl.Substring($SiteServerRelPath.Length).TrimStart('/')
+                if ($SiteRelativeTargetFolder) {
+                    $null = Resolve-PnPFolder -SiteRelativePath $SiteRelativeTargetFolder -ErrorAction Stop
+                }
+
+                Write-Host "  [ARCHIVING] $($File.Path) -> $TargetUrl" -ForegroundColor Magenta
+
+                # 2. Download source file into memory stream and upload directly to destination folder
+                $UploadStream = Get-PnPFile -Url $File.Path -AsMemoryStream -ErrorAction Stop
+                $UploadedFile = Add-PnPFile -FileName $TargetFileName -Folder $TargetFolderUrl -Stream $UploadStream -ErrorAction Stop
+
+                # 3. Preserve original Modified timestamp without bumping version
+                $NewItem = Get-PnPFile -Url $UploadedFile.ServerRelativeUrl -AsListItem -ErrorAction Stop
+                $null = Set-PnPListItem -List $ArchiveLibrary -Identity $NewItem.Id -Values @{
+                    "Modified" = $File.Modified
+                } -UpdateType SystemUpdate -ErrorAction Stop
+
+                # 4. Recycle the original source file only after upload + metadata update succeed
+                Remove-PnPListItem -List $SourceLibrary -Identity $File.Id -Recycle -Force -ErrorAction Stop
+                [void]$RemovedSourcePaths.Add($File.Path)
+            }
+            catch {
+                Write-DetailedError -Context "Failed to archive '$($File.Path)' -> '$TargetUrl'" -ErrorRecord $_
+            }
+            finally {
+                if ($null -ne $UploadStream) {
+                    $UploadStream.Dispose()
+                }
+            }
+        }
+    }
+}
+
+# ==============================================================================
+# PHASE 3: CLEAN UP EMPTY FOLDERS IN SOURCE LIBRARY (BOTTOM-UP)
+# ==============================================================================
+Write-Host "`n--- PHASE 3: EMPTY FOLDER CLEANUP ---" -ForegroundColor Cyan
+
+$AllFolders = $AllLibraryItems | Where-Object {
+    $_.FileSystemObjectType -eq "Folder" -and
+    $_.FieldValues["FileRef"] -ne $ArchiveRoot -and
+    $_.FieldValues["FileRef"] -notlike "$ArchiveRoot/*" -and
+    $_.FieldValues["FileRef"] -notlike "$SourceRootPath/Forms*"
+}
+
+# Sort deepest paths first so nested child folders are evaluated before parent folders
+$SortedFolders = $AllFolders | Sort-Object -Property @{
+    Expression = { ($_.FieldValues["FileRef"].ToCharArray() | Where-Object { $_ -eq '/' }).Count }
+    Descending = $true
+}, @{
+    Expression = { $_.FieldValues["FileRef"].Length }
+    Descending = $true
+}
+
+$EmptyFolderCount = 0
+
+foreach ($Folder in $SortedFolders) {
+    $FolderPath = $Folder["FileRef"]
+
+    $RemainingChildren = $AllLibraryItems | Where-Object {
+        $ItemPath = $_.FieldValues["FileRef"]
+        $ItemPath -like "$FolderPath/*" -and (-not $RemovedSourcePaths.Contains($ItemPath))
+    }
+
+    if (-not $RemainingChildren) {
+        $EmptyFolderCount++
+        [void]$RemovedSourcePaths.Add($FolderPath)
+
+        if ($DryRun) {
+            Write-Host "  [DRY RUN - WOULD RECYCLE EMPTY FOLDER] $FolderPath" -ForegroundColor DarkYellow
+        }
+        else {
+            try {
+                Write-Host "  [RECYCLING EMPTY FOLDER] $FolderPath" -ForegroundColor Red
+                Remove-PnPListItem -List $SourceLibrary -Identity $Folder.Id -Recycle -Force -ErrorAction Stop
+            }
+            catch {
+                Write-DetailedError -Context "Failed to recycle empty folder '$FolderPath'" -ErrorRecord $_
+                [void]$RemovedSourcePaths.Remove($FolderPath)
+            }
+        }
+    }
+}
+
+if ($EmptyFolderCount -eq 0) {
+    Write-Host "No empty folders found to remove." -ForegroundColor Green
+}
+
+Disconnect-PnPOnline
+Write-Host "`nAll tasks complete!" -ForegroundColor Cyan
